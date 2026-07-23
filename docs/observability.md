@@ -1,14 +1,59 @@
 # 可观测性总览
 
-本文档描述本项目可观测性基础设施的接入方式与使用规范。
+本文档描述本项目可观测性基础设施的设计、接入方式与使用规范。
 
-## 日志（Logging）
+## 背景与目标
 
-- 框架：`tracing` / `log` crate（Rust）
-- 输出：
-  - 控制台（stderr）：人类可读的纯文本（含时间戳、级别、消息）
-  - 文件（可选）：结构化 JSON，每行一条记录（JSON Lines）
-- 级别约定：ERROR=需要立即处理的故障；WARN=可恢复的异常；INFO=关键业务事件；DEBUG=开发调试
+CLI 工具需要完整的操作记录能力，用于问题排查和审计回溯。本模块的目标：
+
+- 每次 CLI 调用产生一个完整、可追溯的操作记录链路
+- 支持双通道输出：终端人类可读格式 + 文件结构化持久存储
+- 静默优先，默认不干扰终端输出；通过 verbose 标志开启控制台日志
+
+## 初始化
+
+模块在 CLI 入口处统一初始化，负责：
+
+- 生成本次调用的 trace ID（UUID）
+- 清除 tracing 框架默认的全局 subscriber，确保静默（避免 Tab 补全或 shell completion 时产生框架日志副作用）
+- 根据 verbose 标志决定是否向 stderr 注册控制台 subscriber
+- 始终向审计目录注册文件 subscriber（JSON Lines 格式，每条日志一行 JSON）
+
+## 日志输出
+
+| 输出目标 | 格式 | 触发条件 |
+|---------|------|---------|
+| 控制台（stderr） | 人类可读纯文本：时间戳 + 级别 + 模块名 + 消息 | 仅当 `--verbose` / `-v` 标志开启 |
+| 文件（审计目录） | 结构化 JSON，每行一条记录 | 始终开启 |
+
+JSON 文件日志包含字段：timestamp、level、message、target（模块路径）、trace_id、span_id（若在 span 内）、fields（结构化字段）
+
+## 日志级别
+
+- **ERROR**：需要立即处理的故障（如文件写入失败、外部调用异常）
+- **WARN**：可恢复的异常（如非关键配置缺失、降级处理）
+- **INFO**：关键业务事件（如命令开始、外部调用提交、结果摘要）
+- **DEBUG**：开发调试信息（详细参数、中间状态、耗时统计）
+
+## trace ID 与 span
+
+- 每次 CLI 调用有一个 trace ID，贯穿整个调用链
+- 每个独立的子操作（外部命令执行、API 调用等）对应一个 span，拥有独立 span ID
+- trace ID 与 span ID 通过 tracing crate 的 span 机制自动传播，无需在函数间显式传递参数
+- span 记录起止时间戳与耗时
+
+## 审计目录
+
+- 默认路径：`~/.buddy/audit/`，可通过环境变量 `BUDDY_AUDIT_DIR` 覆盖
+- 每次调用在审计目录下创建子目录，命名格式：`<YYYYMMDD-HHMMSS>-<trace_id 前 8 位>/`
+- 子目录内包含：
+  - `log.jsonl`：结构化日志记录（JSON Lines）
+  - `summary.json`：调用摘要（命令、参数、状态、总耗时、span 数量、错误信息）
+- 保留策略：默认 30 天（未来可由用户通过配置文件调整）
+
+## 终端摘要
+
+每次命令执行完毕（无论成功或失败），stderr 输出一行摘要：命令名、状态（SUCCESS / FAILED）、总耗时、审计目录路径。
 
 ## 关键路径日志链路设计
 
@@ -27,6 +72,39 @@
   - **正常出口**：记录处理结果摘要与总耗时
 - **闭环机制**：每次新增一条 debugging-record 时，在"预防措施"小节明确补充：本次故障对应的关键路径是否已具备完整日志？若否，本次修复必须同步补齐日志埋点。
 
+## 边界与约束
+
+- 本模块只管理**本 CLI 工具自身的操作日志**，不涉及调用外部系统时的服务端日志
+- 不提供日志查询/检索界面，用户自行用 `cat`、`jq` 等工具浏览审计文件
+- 不提供远程日志上传或聚合功能
+- 审计目录清理由用户负责，工具仅声明默认保留策略
+- 日志输出到 stderr 而非 stdout，避免干扰可能的管道输出
+
+## 验证标准
+
+**完成判据** — 集成测试用例须验证：
+
+1. 无 `-v` 标志时，终端无日志输出
+2. 带 `-v` 标志时，终端有符合格式的日志输出
+3. 审计目录中产生 `log.jsonl` 和 `summary.json`
+4. `summary.json` 中的 trace_id 与 `log.jsonl` 中的 trace_id 一致
+5. 同一 trace 内各日志条目的 trace_id 相同，不同调用产生不同 trace_id
+
+## 依赖关系
+
+- `tracing` crate — 结构化日志框架，提供 span、event、level 等核心抽象
+- `tracing-subscriber` crate — subscriber 注册与输出格式化
+- `tracing-appender` crate — 文件日志的轮转与写入
+- `uuid` crate — trace ID / span ID 生成
+- CLI 入口层（main.rs 或 clap 命令处理器）在命令执行前调用初始化
+
 ## 健康检查
 
 CLI 工具无持续运行的服务进程，不需要 `GET /health` 端点。通过 `--version` 和退出码来验证工具可用性。
+
+## 代码实现索引
+
+| 职责 | 文件路径 |
+|------|---------|
+| 日志初始化、trace ID 生成 | [src/logging.rs](../src/logging.rs) |
+| CLI 入口集成 | [src/main.rs](../src/main.rs) | |
